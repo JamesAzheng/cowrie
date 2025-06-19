@@ -179,7 +179,7 @@ class Output(metaclass=abc.ABCMeta):
         if "message" not in event and "format" not in event:
             return
 
-        ev: dict[str, any] = convert(event)  # type: ignore
+        ev: dict[str, Any] = convert(event)  # type: ignore
         ev["sensor"] = self.sensor
 
         ev.pop("isError", None)
@@ -227,7 +227,10 @@ class Output(metaclass=abc.ABCMeta):
             print(f"Can't determine sessionno: {ev!r}")  # noqa: T201
             return
 
-        if sessionno in self.ips:
+        # 确保 src_ip 存在且正确赋值
+        if "src_ip" in ev:
+            self.ips[sessionno] = ev["src_ip"]
+        elif sessionno in self.ips:
             ev["src_ip"] = self.ips[sessionno]
 
         # Connection event is special. adds to session list
@@ -235,11 +238,19 @@ class Output(metaclass=abc.ABCMeta):
             self.sessions[sessionno] = ev["session"]
             self.ips[sessionno] = ev["src_ip"]
         else:
-            ev["session"] = self.sessions[sessionno]
+            # 检查 sessionno 是否存在于 self.sessions 中
+            if sessionno in self.sessions:
+                ev["session"] = self.sessions[sessionno]
+            else:
+                # 处理 sessionno 不存在的情况，可记录日志或跳过
+                print(f"Sessionno {sessionno} not found in self.sessions: {ev!r}")  # noqa: T201
+                return
 
         self.write(ev)
 
         # Disconnect is special, remove cached data
         if ev["eventid"] == "cowrie.session.closed":
-            del self.sessions[sessionno]
-            del self.ips[sessionno]
+            if sessionno in self.sessions:
+                del self.sessions[sessionno]
+            if sessionno in self.ips:
+                del self.ips[sessionno]

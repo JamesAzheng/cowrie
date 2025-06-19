@@ -23,7 +23,6 @@ class Output(cowrie.core.output.Output):
         host = CowrieConfig.get("output_elasticsearch", "host")
         port = CowrieConfig.get("output_elasticsearch", "port")
         self.index = CowrieConfig.get("output_elasticsearch", "index")
-        self.type = CowrieConfig.get("output_elasticsearch", "type")
         self.pipeline = CowrieConfig.get("output_elasticsearch", "pipeline")
         # new options (creds + https)
         username = CowrieConfig.get("output_elasticsearch", "username", fallback=None)
@@ -121,5 +120,5 @@ class Output(cowrie.core.output.Output):
                 del event[i]
 
         self.es.index(
-            index=self.index, doc_type=self.type, body=event, pipeline=self.pipeline
+            index=self.index, body=event, pipeline=self.pipeline
         )

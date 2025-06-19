@@ -43,6 +43,13 @@ class HoneyPotSSHTransport(transport.SSHServerTransport, TimeoutMixin):
     outgoingCompression: Any
     _blockedByKeyExchange: Any
 
+    def __init__(self):
+        super().__init__()
+        self.buf = b""
+        self._proxy_checked = False  # 是否已检查 PROXY 协议头
+        self.src_ip = None  # 初始化源 IP 地址
+        self.src_port = None  # 初始化源端口号
+
     def __repr__(self) -> str:
         """
         Return a pretty representation of this object.
@@ -54,37 +61,56 @@ class HoneyPotSSHTransport(transport.SSHServerTransport, TimeoutMixin):
 
     def connectionMade(self) -> None:
         """
-        Called when the connection is made from the other side.
-        We send our version, but wait with sending KEXINIT
+        当与远程端建立连接时调用此方法。
+        我们会发送自己的版本字符串，但暂不发送密钥交换初始化消息（KEXINIT）。
         """
+        # 初始化缓冲区，用于存储后续接收到的数据
         self.buf = b""
 
+        # 生成一个唯一的传输 ID，使用 UUID 的前 12 个十六进制字符，用于标识本次连接
         self.transportId = uuid.uuid4().hex[:12]
-        src_ip: str = self.transport.getPeer().host
+        # 初始使用默认值，后续在 dataReceived 中更新
+        self.src_ip = self.transport.getPeer().host
+        self.src_port = self.transport.getPeer().port
 
+        # 从实例属性获取 src_ip
+        src_ip = self.src_ip
+        print(f"Connection made from {src_ip}:{self.src_port} to {self.transport.getHost().host}:{self.transport.getHost().port}")
+
+        # 使用预编译的正则表达式检查远程客户端的 IP 地址是否为 IPv6 格式的 IPv4 映射地址
         ipv4_search = self.ipv4rex.search(src_ip)
         if ipv4_search is not None:
+            # 若为 IPv6 格式的 IPv4 映射地址，提取出实际的 IPv4 地址
             src_ip = ipv4_search.group(1)
+            # 更新实例属性
+            self.src_ip = src_ip
 
-        log.msg(
-            eventid="cowrie.session.connect",
-            format="New connection: %(src_ip)s:%(src_port)s (%(dst_ip)s:%(dst_port)s) [session: %(session)s]",
-            src_ip=src_ip,
-            src_port=self.transport.getPeer().port,
-            dst_ip=self.transport.getHost().host,
-            dst_port=self.transport.getHost().port,
-            session=self.transportId,
-            sessionno=f"S{self.transport.sessionno}",
-            protocol="ssh",
-        )
+        # 记录新连接的日志信息（初始值，可能为代理 IP）
+        # log.msg(
+        #     eventid="cowrie.session.connect",
+        #     format="Initial connection: %(src_ip)s:%(src_port)s (%(dst_ip)s:%(dst_port)s) [session: %(session)s]",
+        #     src_ip=self.src_ip,  # 远程客户端的 IP 地址
+        #     src_port=self.src_port,  # 远程客户端的端口号
+        #     dst_ip=self.transport.getHost().host,  # 本地服务的 IP 地址
+        #     dst_port=self.transport.getHost().port,  # 本地服务的端口号
+        #     session=self.transportId,  # 唯一的传输 ID
+        #     sessionno=f"S{self.transport.sessionno}",  # 会话编号，前缀 "S" 表示 SSH 会话
+        #     protocol="ssh"
+        # )
 
+        # 向远程客户端发送本地 SSH 服务的版本字符串，并添加回车换行符
         self.transport.write(self.ourVersionString + b"\r\n")
+
+        # 初始化 SSH 加密算法配置，初始状态下不使用加密、消息认证码（MAC）和压缩算法
         self.currentEncryptions = transport.SSHCiphers(
             b"none", b"none", b"none", b"none"
         )
+        # 设置加密所需的密钥，初始时所有密钥都为空
         self.currentEncryptions.setKeys(b"", b"", b"", b"", b"", b"")
 
+        # 记录连接建立的时间戳，用于后续计算会话持续时间
         self.startTime: float = time.time()
+        # 设置认证超时时间，若在该时间内客户端未完成认证，将触发超时处理
         self.setTimeout(self.auth_timeout)
 
     def sendKexInit(self) -> None:
@@ -103,14 +129,46 @@ class HoneyPotSSHTransport(transport.SSHServerTransport, TimeoutMixin):
         self.transport.loseConnection()
 
     def dataReceived(self, data: bytes) -> None:
-        """
-        First, check for the version string (SSH-2.0-*).  After that has been
-        received, this method adds data to the buffer, and pulls out any
-        packets.
+        if not self._proxy_checked:
+            self.buf += data
+            if b"\r\n" not in self.buf:
+                return
+            line, rest = self.buf.split(b"\r\n", 1)
+            if line.startswith(b"PROXY "):
+                parts = line.strip().split()
+                if len(parts) >= 6:
+                    # 提取源 IP 地址和端口号
+                    self.src_ip = parts[2].decode()
+                    self.src_port = int(parts[4])
+                    self.dst_ip = parts[3].decode()
+                    self.dst_port = int(parts[5])
+                    # 记录更新后的连接日志，使用正确的 src_ip
+                    log.msg(
+                        eventid="cowrie.session.connect",
+                        format="New connection: %(src_ip)s:%(src_port)s (%(dst_ip)s:%(dst_port)s) [session: %(session)s]",
+                        src_ip=self.src_ip,
+                        src_port=self.src_port,
+                        dst_ip=self.dst_ip,
+                        dst_port=self.dst_port,
+                        session=self.transportId,
+                        sessionno=f"S{self.transport.sessionno}",
+                        protocol="ssh"
+                    )
+                else:
+                    self.src_ip = self.transport.getPeer().host
+                    self.src_port = self.transport.getPeer().port
+            else:
+                self.src_ip = self.transport.getPeer().host
+                self.src_port = self.transport.getPeer().port
+                rest = self.buf
+            self._proxy_checked = True
+            self.buf = rest
+            # 进入后续 SSH 处理
+            if not self.buf:
+                self.buf = data
+        else:
+            self.buf += data
 
-        @type data: C{str}
-        """
-        self.buf = self.buf + data
         if not self.gotVersion:
             if b"\n" not in self.buf:
                 return
@@ -144,6 +202,7 @@ class HoneyPotSSHTransport(transport.SSHServerTransport, TimeoutMixin):
             messageNum = ord(packet[0:1])
             self.dispatchMessage(messageNum, packet[1:])
             packet = self.getPacket()
+
 
     def dispatchMessage(self, messageNum: int, payload: bytes) -> None:
         transport.SSHServerTransport.dispatchMessage(self, messageNum, payload)
